@@ -1,0 +1,97 @@
+# Code used to generate date used in Figure 5.4
+import numpy
+from firedrake import (Constant, DistributedMeshOverlapType, Function,
+                       FunctionSpace, MeshHierarchy, TestFunction,
+                       UnitCubeMesh, curl, dx, inner)
+from firedrake.petsc import PETSc
+from irksome import Dt, RadauIIA, TimeStepper
+from irksome.tools import IA
+from mpi4py import MPI
+
+dist_params = {"partition": True,
+               "overlap_type": (DistributedMeshOverlapType.VERTEX, 1)}
+
+PETSc.Log().begin()
+
+
+def get_time(event, comm=MPI.COMM_WORLD):
+    return comm.allreduce(PETSc.Log.Event(event).getPerfInfo()["time"],
+                          op=MPI.SUM) / comm.size
+
+
+params = {
+    "snes_type": "ksponly",
+    "ksp_type": "gmres",
+    "ksp_converged_reason": None,
+    "ksp_gmres_restart": 100,
+    "ksp_rtol": 1.e-8,
+    "pc_type": "mg",
+    "mg_levels": {
+        "ksp_type": "chebyshev",
+        "ksp_chebyshev_esteig": "0.0,0.25,0,1.2",
+        "ksp_convergence_test": "skip",
+        "ksp_max_it": 2,
+        "pc_type": "python",
+        "pc_python_type": "firedrake.ASMStarPC",
+        "pc_star_construct_dim": 0,
+        "pc_star_backend_type": "tinyasm"
+    },
+    "mg_coarse": {
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "factor_mat_solver_type": "pastix"
+    }
+}
+
+
+def run(N_base, levels, cfl, deg, bt):
+    msh_base = UnitCubeMesh(N_base, N_base, N_base,
+                            distribution_parameters=dist_params)
+    mh = MeshHierarchy(msh_base, levels)
+    msh = mh[-1]
+
+    V = FunctionSpace(msh, "N1curl", deg)
+
+    AA = Function(V)
+    v = TestFunction(V)
+
+    AA.dat.data[:] = numpy.random.rand(*AA.dat.data.shape)
+
+    t = Constant(0, domain=msh)
+    dt = Constant(cfl / N_base / 2**levels)
+
+    F = inner(Dt(AA), v) * dx + inner(curl(AA), curl(v)) * dx
+
+    if deg == 1:
+        params["mg_levels"]["ksp_chebyshev_esteig"] = "0.0,0.1,0,1.05"
+    elif deg == 2:
+        params["mg_levels"]["ksp_chebyshev_esteig"] = "0.0,0.25,0,1.2"
+
+    stepper = TimeStepper(F, bt, t, dt, AA,
+                          splitting=IA,
+                          solver_parameters=params)
+
+    myksp = stepper.solver.snes.getKSP()
+    stepper.advance()
+    sn = f"{N_base}{levels}{cfl}{deg}{str(bt)}{cfl}"
+    PETSc.Sys.Print(sn)
+    with PETSc.Log.Stage(sn):
+        stepper.advance()
+        snes = get_time("KSPSolve")
+
+    nv = FunctionSpace(msh, "CG", 1).dim()
+    return (nv, snes, myksp.getIterationNumber())
+
+
+N_base = 4
+
+with open(f"eddy.{MPI.COMM_WORLD.size}procs.csv", "w") as f:
+    f.write("deg,level,nv,stages,cfl,time,its\n")
+    for deg in (1, 2):
+        for levels in (1, 2, 3)[1:2]:
+            for cfl in (1, 4, 8)[1:2]:
+                for k in (1, 2, 3, 4, 5):
+                    PETSc.Sys.Print(f"RadauIIA({k}) on refinement level {levels} for degree {deg} with cfl {cfl}:")  # noqa
+                    nv, tm, its = run(N_base, levels, cfl, deg, RadauIIA(k))
+                    PETSc.Sys.Print(f"   {nv} vertices, {tm} seconds, {its} iterations")  # noqa
+                    f.write(f"{deg},{levels},{nv},{k},{cfl},{tm},{its}\n")
