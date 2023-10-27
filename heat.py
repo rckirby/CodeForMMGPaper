@@ -1,8 +1,8 @@
 # Code used to generate date used in Figure 5.2
 import numpy
-from firedrake import (Constant, DistributedMeshOverlapType, Function,
-                       FunctionSpace, MeshHierarchy, TestFunction,
-                       UnitCubeMesh, dx, grad, inner)
+from firedrake import (PCG64, Constant, DistributedMeshOverlapType, Function,
+                       FunctionSpace, MeshHierarchy, RandomGenerator,
+                       TestFunction, UnitCubeMesh, dx, grad, inner, prolong)
 from firedrake.petsc import PETSc
 from irksome import Dt, RadauIIA, TimeStepper
 from irksome.tools import IA
@@ -42,6 +42,27 @@ params = {
 }
 
 
+def get_random(mh, deg):
+    rg = RandomGenerator(PCG64(seed=123456789))
+    Vcoarse = FunctionSpace(mh[0], "CG", deg)
+    u_noise = rg.uniform(Vcoarse, -1, 1)
+
+    for m in mh[1:]:
+        u_coarse = u_noise
+        Vcoarse = FunctionSpace(m, "CG", deg)
+        u_noise = Function(Vcoarse)
+        prolong(u_coarse, u_noise)
+        u_noise.assign(10*u_noise + rg.uniform(Vcoarse, -1, 1))
+
+    msh = mh[-1]
+    V = FunctionSpace(msh, "CG", 1)
+
+    u_coarse = u_noise
+    u_noise = rg.uniform(V, -1, 1)
+    u_noise.assign(u_noise+u_coarse)
+    return u_noise
+
+
 def run(N_base, levels, cfl, deg, bt):
     msh_base = UnitCubeMesh(N_base, N_base, N_base,
                             distribution_parameters=dist_params)
@@ -50,10 +71,8 @@ def run(N_base, levels, cfl, deg, bt):
 
     V = FunctionSpace(msh, "CG", deg)
 
-    AA = Function(V)
+    AA = get_random(mh, deg)
     v = TestFunction(V)
-
-    AA.dat.data[:] = numpy.random.rand(*AA.dat.data.shape)
 
     t = Constant(0, domain=msh)
     dt = Constant(cfl / N_base / 2**levels)
@@ -78,12 +97,12 @@ def run(N_base, levels, cfl, deg, bt):
 
 N_base = 4
 
-with open(f"heat.{MPI.COMM_WORLD.size}procs.csv", "w") as f:
+with open(f"heat.{MPI.COMM_WORLD.size}procs.foo.csv", "w") as f:
     f.write("deg,level,nv,stages,cfl,time,its\n")
     for deg in (1, 2):
-        for levels in (1, 2, 3):
+        for levels in (1, 2, 3)[:2]:
             for cfl in (1, 4, 8):
-                for k in (1, 2, 3, 4, 5):
+                for k in (1, 2, 3, 4, 5)[:2]:
                     PETSc.Sys.Print(f"RadauIIA({k}) on refinement level {levels} for degree {deg} with cfl {cfl}:")  # noqa
                     nv, tm, its = run(N_base, levels, cfl, deg, RadauIIA(k))
                     PETSc.Sys.Print(f"   {nv} vertices, {tm} seconds, {its} iterations")  # noqa
