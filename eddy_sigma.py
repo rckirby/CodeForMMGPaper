@@ -1,11 +1,12 @@
 # Code used to estimate contraction constant for MG iteration
 # for multi-stage heat equation
+import gc
 from copy import deepcopy
 
 import numpy
 from firedrake import (PCG64, Constant, DistributedMeshOverlapType, Function,
                        FunctionSpace, MeshHierarchy, RandomGenerator,
-                       TestFunction, UnitCubeMesh, dx, grad, inner, prolong)
+                       TestFunction, UnitCubeMesh, curl, dx, inner, prolong)
 from firedrake.petsc import PETSc
 from irksome import Dt, RadauIIA, TimeStepper
 from irksome.tools import IA
@@ -27,6 +28,7 @@ params = {
     "pc_type": "mg",
     "mg_levels": {
         "ksp_type": "chebyshev",
+        "ksp_chebyshev_esteig": "0.0,0.25,0,1.2",
         "ksp_convergence_test": "skip",
         "ksp_max_it": 2,
         "pc_type": "python",
@@ -43,25 +45,27 @@ params = {
 
 
 def get_random(mh, deg):
-    Vs = [FunctionSpace(m, "CG", deg) for m in mh]
-    noise = [rg.uniform(V, -1, 1) for V in Vs]
+    return rg.uniform(FunctionSpace(mh[-1], "N1curl", deg), -1, 1)
+    # Vs = [FunctionSpace(m, "N1curl", deg) for m in mh]
+    # noise = [rg.uniform(V, -1, 1) for V in Vs]
 
-    for i in range(1, len(noise)):
-        foo = Function(Vs[i])
-        prolong(noise[i-1], foo)
-        noise[i].assign(10 * foo + noise[i])
+    # for i in range(1, len(noise)):
+    #     foo = Function(Vs[i])
+    #     prolong(noise[i-1], foo)
+    #     noise[i].assign(10 * foo + noise[i])
 
-    return noise[-1]
+    # return noise[-1]
 
 
 def sigma(N_base, levels, cfl, deg, bt, tols):
+    gc.collect()
     PETSc.Sys.Print(N_base, levels, cfl, deg, bt, tols)
     msh_base = UnitCubeMesh(N_base, N_base, N_base,
                             distribution_parameters=dist_params)
     mh = MeshHierarchy(msh_base, levels)
     msh = mh[-1]
 
-    V = FunctionSpace(msh, "CG", deg)
+    V = FunctionSpace(msh, "N1curl", deg)
 
     AA = get_random(mh, deg)
     v = TestFunction(V)
@@ -69,22 +73,29 @@ def sigma(N_base, levels, cfl, deg, bt, tols):
     t = Constant(0)
     dt = Constant(cfl / N_base / 2**levels)
 
-    F = inner(Dt(AA), v) * dx + inner(grad(AA), grad(v)) * dx
+    if deg == 1:
+        params["mg_levels"]["ksp_chebyshev_esteig"] = "0.0,0.1,0,1.05"
+    elif deg == 2:
+        params["mg_levels"]["ksp_chebyshev_esteig"] = "0.0,0.25,0,1.2"
+
+    F = inner(Dt(AA), v) * dx + inner(curl(AA), curl(v)) * dx
 
     its = {}
 
-    # measure iterations to convergence for each tolerance
+    par_cur = deepcopy(params)
+
+    stepper = TimeStepper(F, bt, t, dt, AA,
+                          splitting=IA,
+                          solver_parameters=par_cur)
+
+    ksp = stepper.solver.snes.getKSP()
     for myeps in tols:
-        par_cur = deepcopy(params)
-        par_cur["ksp_rtol"] = myeps
-
-        stepper = TimeStepper(F, bt, t, dt, AA,
-                              splitting=IA,
-                              solver_parameters=par_cur)
-
+        ksp.setTolerances(rtol=myeps)
         stepper.advance()
 
-        its[myeps] = stepper.solver.snes.getKSP().getIterationNumber()
+        its[myeps] = ksp.getIterationNumber()
+    # measure iterations to convergence for each tolerance
+
 
     # estimate convergence rate:
     # sigma^(its) = eps
@@ -123,7 +134,7 @@ for deg in degs:
 if MPI.COMM_WORLD.rank == 0:
     print(results)
     
-    with open("heatsigma.csv", "w") as f:
+    with open("eddysigma.csv", "w") as f:
         headers = [f"{deg}:{cfl}" for deg in degs for cfl in cfls]
         f.write(f"NS,{','.join(headers)}\n")
         for ns in stages:

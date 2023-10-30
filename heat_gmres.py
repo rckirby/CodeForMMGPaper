@@ -1,4 +1,8 @@
-# Code used to generate date used in Figure 5.2
+# Code used to estimate contraction constant for MG iteration
+# for multi-stage heat equation
+import pickle
+from copy import deepcopy
+
 import numpy
 from firedrake import (PCG64, Constant, DistributedMeshOverlapType, Function,
                        FunctionSpace, MeshHierarchy, RandomGenerator,
@@ -8,21 +12,23 @@ from irksome import Dt, RadauIIA, TimeStepper
 from irksome.tools import IA
 from mpi4py import MPI
 
-dist_params = {"partition": True,
-               "overlap_type": (DistributedMeshOverlapType.VERTEX, 1)}
-
 PETSc.Log().begin()
-
-
 def get_time(event, comm=MPI.COMM_WORLD):
     return comm.allreduce(PETSc.Log.Event(event).getPerfInfo()["time"],
                           op=MPI.SUM) / comm.size
 
 
+dist_params = {"partition": True,
+               "overlap_type": (DistributedMeshOverlapType.VERTEX, 1)}
+
+rg = RandomGenerator(PCG64(seed=123456789))
+
+
 params = {
     "snes_type": "ksponly",
     "ksp_type": "gmres",
-    "ksp_gmres_restart": 12,
+    "ksp_gmres_restart": 20,
+    "ksp_monitor": None,
     "ksp_rtol": 1.e-8,
     "pc_type": "mg",
     "mg_levels": {
@@ -43,27 +49,19 @@ params = {
 
 
 def get_random(mh, deg):
-    rg = RandomGenerator(PCG64(seed=123456789))
-    Vcoarse = FunctionSpace(mh[0], "CG", deg)
-    u_noise = rg.uniform(Vcoarse, -1, 1)
+    Vs = [FunctionSpace(m, "CG", deg) for m in mh]
+    noise = [rg.uniform(V, -1, 1) for V in Vs]
 
-    for m in mh[1:]:
-        u_coarse = u_noise
-        Vcoarse = FunctionSpace(m, "CG", deg)
-        u_noise = Function(Vcoarse)
-        prolong(u_coarse, u_noise)
-        u_noise.assign(10*u_noise + rg.uniform(Vcoarse, -1, 1))
+    for i in range(1, len(noise)):
+        foo = Function(Vs[i])
+        prolong(noise[i-1], foo)
+        noise[i].assign(10 * foo + noise[i])
 
-    msh = mh[-1]
-    V = FunctionSpace(msh, "CG", 1)
-
-    u_coarse = u_noise
-    u_noise = rg.uniform(V, -1, 1)
-    u_noise.assign(u_noise+u_coarse)
-    return u_noise
+    return noise[-1]
 
 
-def run(N_base, levels, cfl, deg, bt):
+def time_its(N_base, levels, cfl, deg, bt):
+    PETSc.Sys.Print(N_base, levels, cfl, deg, bt)
     msh_base = UnitCubeMesh(N_base, N_base, N_base,
                             distribution_parameters=dist_params)
     mh = MeshHierarchy(msh_base, levels)
@@ -74,7 +72,7 @@ def run(N_base, levels, cfl, deg, bt):
     AA = get_random(mh, deg)
     v = TestFunction(V)
 
-    t = Constant(0, domain=msh)
+    t = Constant(0)
     dt = Constant(cfl / N_base / 2**levels)
 
     F = inner(Dt(AA), v) * dx + inner(grad(AA), grad(v)) * dx
@@ -83,27 +81,35 @@ def run(N_base, levels, cfl, deg, bt):
                           splitting=IA,
                           solver_parameters=params)
 
-    myksp = stepper.solver.snes.getKSP()
-    stepper.advance()
     sn = f"{N_base}{levels}{cfl}{deg}{str(bt)}{cfl}"
     PETSc.Sys.Print(sn)
     with PETSc.Log.Stage(sn):
         stepper.advance()
         snes = get_time("KSPSolve")
 
-    nv = FunctionSpace(msh, "CG", 1).dim()
-    return (nv, snes, myksp.getIterationNumber())
+    return stepper.solver.snes.getKSP().getIterationNumber(), snes
 
 
 N_base = 4
+levels = 3
 
-with open(f"heat.{MPI.COMM_WORLD.size}procs.csv", "w") as f:
-    f.write("deg,level,nv,stages,cfl,time,its\n")
-    for deg in (1, 2):
-        for levels in (1, 2, 3):
-            for cfl in (1, 8):
-                for k in (1, 2, 3, 4, 5):
-                    PETSc.Sys.Print(f"RadauIIA({k}) on refinement level {levels} for degree {deg} with cfl {cfl}:")  # noqa
-                    nv, tm, its = run(N_base, levels, cfl, deg, RadauIIA(k))
-                    PETSc.Sys.Print(f"   {nv} vertices, {tm} seconds, {its} iterations")  # noqa
-                    f.write(f"{deg},{levels},{nv},{k},{cfl},{tm},{its}\n")
+stages = (1, 2, 3, 4, 5)
+degs = (1, 2)
+cfls = (1, 8)
+
+results = {}
+
+for deg in degs:
+    for ns in stages:
+        bt = RadauIIA(ns)
+        for lev in range(1, levels+1):
+            for cfl in cfls:
+                its, tm = time_its(N_base, levels, cfl, deg, bt)
+                x = f"k {deg}, RIIA({ns}), cfl {cfl}: T {tm}, Its {its}"
+                PETSc.Sys.Print(x)
+                results[(deg, ns, lev, cfl)] = tm, its
+
+if MPI.COMM_WORLD.rank == 0:
+    print(results)
+    with open("heatgmres.dat", "wb") as f:
+        pickle.dump(results, f)
