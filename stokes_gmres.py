@@ -14,36 +14,20 @@ from irksome import Dt, RadauIIA, TimeStepper
 from irksome.tools import IA
 from mpi4py import MPI
 
+
+PETSc.Log().begin()
+
+
+def get_time(event, comm=MPI.COMM_WORLD):
+    return comm.allreduce(PETSc.Log.Event(event).getPerfInfo()["time"],
+                          op=MPI.SUM) / comm.size
+
+
+
 dist_params = {"partition": True,
                "overlap_type": (DistributedMeshOverlapType.VERTEX, 1)}
 
 rg = RandomGenerator(PCG64(seed=123456789))
-
-
-params = {
-    "snes_type": "ksponly",
-    "ksp_type": "richardson",
-    "ksp_richardson_scale": 1.0,
-    "ksp_monitor": None,
-    "ksp_gmres_restart": 100,
-    "ksp_rtol": 1.e-12,
-    "pc_type": "mg",
-    "mg_levels": {
-        "ksp_type": "chebyshev",
-        "ksp_chebyshev_esteig": "0.0,0.25,0,1.2",
-        "ksp_convergence_test": "skip",
-        "ksp_max_it": 2,
-        "pc_type": "python",
-        "pc_python_type": "firedrake.ASMStarPC",
-        "pc_star_construct_dim": 0,
-        "pc_star_backend_type": "tinyasm"
-        },
-    "mg_coarse": {
-        "ksp_type": "preonly",
-        "pc_type": "lu",
-        "pc_factor_mat_solver_type": "mumps"
-    }
-}
 
 
 def get_random(mh):
@@ -52,9 +36,9 @@ def get_random(mh):
     return rg.random(V0*V1)
 
 
-def sigma(N_base, levels, cfl, bt, tols):
+def run(levels, cfl, bt):
     gc.collect()
-    PETSc.Sys.Print(N_base, levels, cfl, bt, tols)
+    PETSc.Sys.Print(levels, cfl, bt)
     msh_base = Mesh("obst.quad.msh")
     mh = MeshHierarchy(msh_base, levels)
     msh = mh[-1]
@@ -71,7 +55,6 @@ def sigma(N_base, levels, cfl, bt, tols):
     up = Function(Z)
     u, p = split(up)
     up.subfunctions[0].assign(AA.subfunctions[0])
-
     
     t = Constant(0)
     dt = Constant(cfl * 0.1 / 2**levels)
@@ -98,7 +81,7 @@ def sigma(N_base, levels, cfl, bt, tols):
                  "ksp_monitor": None,
                  "ksp_converged_reason": None,
                  "ksp_gmres_restart": 50,
-                 "ksp_rtol": tols[0],
+                 "ksp_rtol": 1.e-8,
                  "pc_type": "mg",
                  "mg_levels": {
                      "ksp_type": "chebyshev",
@@ -121,52 +104,33 @@ def sigma(N_base, levels, cfl, bt, tols):
     stepper = TimeStepper(F, bt, t, dt, up,
                           splitting=IA,
                           solver_parameters=it_params)
-
-    ksp = stepper.solver.snes.getKSP()
-    for myeps in tols:
-        ksp.setTolerances(rtol=myeps)
+    
+    sn = f"{levels}{cfl}{str(bt)}{cfl}"
+    PETSc.Sys.Print(sn)
+    with PETSc.Log.Stage(sn):
         stepper.advance()
-        
-        its[myeps] = ksp.getIterationNumber()
+        snes = get_time("KSPSolve")
 
-    # estimate convergence rate:
-    # sigma^(its) = eps
-    # its log(sigma) = log(eps)
-    # plot log(eps) vs its,
-    # slope of line is (about) log(sigma)
-    iterations = numpy.array([its[e] for e in tols])
-
-    fit = numpy.polyfit(iterations,
-                        numpy.log(tols),
-                        1)
-    PETSc.Sys.Print(fit)
-    PETSc.Sys.Print(f"Estimated convergence rate: {numpy.exp(fit[0])}")
-    return numpy.exp(fit[0])
+    return stepper.solver.snes.getKSP().getIterationNumber(), snes
 
 
-N_base = 4
-levels = 3
-
+levels = (1, 2, 3, 4)
 stages = (1, 2, 3, 4, 5)
-tols = [1.e-4, 1.e-6, 1.e-8, 1.e-10]
 cfls = (1, 8)
 
 results = {}
 
 for ns in stages:
     bt = RadauIIA(ns)
-    for cfl in cfls:
-        sig = sigma(N_base, levels, cfl, bt, tols)
-        x = f"RadauIIA({ns}), cfl {cfl}: Sigma: {sig}"
-        PETSc.Sys.Print(x)
-        results[(ns, cfl)] = sig
+    for lev in levels:
+        for cfl in cfls:
+            its, tm = run(lev, cfl, bt)
+            x = f"RadauIIA({ns}), cfl {cfl}: Its {its}, tm: {tm}" 
+            PETSc.Sys.Print(x)
+            results[(ns, lev, cfl)] = (its, tm)
 
 if MPI.COMM_WORLD.rank == 0:
     print(results)
-    
-    with open("stokessigma.csv", "w") as f:
-        headers = [f"{cfl}" for cfl in cfls]
-        f.write(f"NS,{','.join(headers)}\n")
-        for ns in stages:
-            vals = [str(results[(ns, cfl)]) for cfl in cfls]
-            f.write(f"{ns},{','.join(vals)}\n")
+    import pickle
+    with open("stokesgmres.dat", "wb") as f:
+        pickle.dump(results, f)

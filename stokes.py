@@ -9,14 +9,14 @@ from irksome import Dt, RadauIIA, TimeStepper
 from irksome.tools import IA
 from mpi4py import MPI
 
-petsc4py.PETSc.Sys.popErrorHandler()
+# petsc4py.PETSc.Sys.popErrorHandler()
 
-PETSc.Log().begin()
+# PETSc.Log().begin()
 
 
-def get_time(event, comm=MPI.COMM_WORLD):
-    return comm.allreduce(PETSc.Log.Event(event).getPerfInfo()["time"],
-                          op=MPI.SUM) / comm.size
+# def get_time(event, comm=MPI.COMM_WORLD):
+#     return comm.allreduce(PETSc.Log.Event(event).getPerfInfo()["time"],
+#                           op=MPI.SUM) / comm.size
 
 
 def run(levels, cfl, bt):
@@ -42,7 +42,7 @@ def run(levels, cfl, bt):
     t = Constant(0, domain=msh)
 
     F = (inner(Dt(u), v) * dx
-         + inner(dot(u, grad(u)), v) * dx
+         + inner(grad(u), grad(v)) * dx
          - inner(p, div(v)) * dx
          + inner(div(u), w) * dx)
 
@@ -58,29 +58,28 @@ def run(levels, cfl, bt):
            DirichletBC(Z.sub(0), Constant((0, 0)), (10, 12))]
 
     exclusions = ",".join([str(2*i+1) for i in range(bt.num_stages)])
-    it_params = {"snes_type": "ksponly",
-                 "ksp_type": "gmres",
-                 "ksp_monitor": None,
-                 "ksp_converged_reason": None,
-                 "ksp_gmres_restart": 50,
-                 "ksp_rtol": 1.e-8,
-                 "pc_type": "mg",
-                 "mg_levels": {
-                     "ksp_type": "chebyshev",
-                     # "ksp_chebyshev_esteig": "0.0,0.25,0,1.2",
-                     "ksp_max_it": 2,
-                     "ksp_convergence_test": "skip",
-                     "pc_type": "python",
-                     "pc_python_type": "firedrake.ASMVankaPC",
-                     "pc_vanka_construct_codim": 0,
-                     "pc_vanka_exclude_subspaces": exclusions,
-                     "pc_vanka_backend_type": "tinyasm"},
-                 "mg_coarse": {
-                     "ksp_type": "preonly",
-                     "pc_type": "lu",
-                     "pc_factor_mat_solver_type": "mumps",
-                     "mat_mumps_icntl_14": 200}
-                 }
+    it_params = {
+        "snes_type": "ksponly",
+        "ksp_type": "gmres",
+        "ksp_monitor": None,
+        "ksp_gmres_restart": 50,
+        "ksp_rtol": 1.e-8,
+        "pc_type": "mg",
+        "mg_levels": {
+            "ksp_type": "chebyshev",
+            # "ksp_chebyshev_esteig": "0.0,0.25,0,1.2",
+            "ksp_max_it": 2,
+            "ksp_convergence_test": "skip",
+            "pc_type": "python",
+            "pc_python_type": "firedrake.ASMVankaPC",
+            "pc_vanka_construct_codim": 0,
+            "pc_vanka_exclude_subspaces": exclusions},
+        "mg_coarse": {
+            "ksp_type": "preonly",
+            "pc_type": "lu",
+            "pc_factor_mat_solver_type": "mumps",
+            "mat_mumps_icntl_14": 200}
+    }
 
     stepper = TimeStepper(F, bt, t, dt, up,
                           bcs=bcs, solver_parameters=it_params,
@@ -91,21 +90,22 @@ def run(levels, cfl, bt):
         stepper.advance()
         t.assign(float(t) + float(dt))
 
-    sn = f"{levels}{cfl}{str(bt)}"
-    PETSc.Sys.Print(sn)
-    with PETSc.Log.Stage(sn):
-        stepper.advance()
-        snes = get_time("KSPSolve")
+    stepper.advance()
+    # sn = f"{levels}{cfl}{str(bt)}"
+    # PETSc.Sys.Print(sn)
+    # with PETSc.Log.Stage(sn):
+    #     stepper.advance()
+    #     # snes = get_time("KSPSolve")
 
     nv = FunctionSpace(msh, "CG", 1).dim()
-    return (nv, snes, myksp.getIterationNumber())
+    return (nv, 0, myksp.getIterationNumber())
 
 
 with open(f"stokes.{MPI.COMM_WORLD.size}procs.csv", "w") as f:
     f.write("level,nv,stages,cfl,time,its\n")
-    for level in (2, 3, 4, 5):
+    for level in (2, 3, 4, 5)[:1]:
         for cfl in (4,):
-            for k in (1, 2, 3, 4, 5):
+            for k in (1, 2, 3, 4, 5)[:1]:
                 PETSc.Sys.Print(f"RadauIIA({k}) on refinement level {level} with cfl {cfl}:")  # noqa
                 nv, tm, its = run(level, cfl, RadauIIA(k))
                 PETSc.Sys.Print(f"   {nv} vertices, {tm} seconds, {its} iterations")  # noqa
