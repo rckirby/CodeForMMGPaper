@@ -1,5 +1,6 @@
 # Code used to estimate contraction constant for MG iteration
 # for multi-stage heat equation
+# Appears in Figure 5.11
 import gc
 from copy import deepcopy
 

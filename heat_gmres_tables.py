@@ -1,3 +1,6 @@
+# maps the generated data from heat equation into CSV files
+# that are processed in the latex file to generate Figures 5.3, 5.4
+
 import pickle
 
 with open("heatgmres.dat", "rb") as f:

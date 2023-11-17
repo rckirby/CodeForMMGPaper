@@ -1,3 +1,5 @@
+# maps the generated data from eddy current into CSV files
+# that are processed in the latex file to generate Figures 5.7, 5.8
 import pickle
 
 with open("eddygmres.dat", "rb") as f:

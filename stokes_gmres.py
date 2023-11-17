@@ -1,5 +1,5 @@
-# Code used to estimate contraction constant for MG iteration
-# for multi-stage heat equation
+# Computes time and iteration counts for Stokes equations with GMRES
+# and dumps the results to a file.  
 import gc
 from copy import deepcopy
 
